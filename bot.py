@@ -1,7 +1,7 @@
 import logging
 import asyncio
 from datetime import datetime, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
 # Настройка логирования
@@ -35,6 +35,8 @@ RULES_TEXT = """
 user_agreements = {}
 # Словарь для хранения задач на кик
 kick_tasks = {}
+# Словарь для хранения ограничений пользователей
+restricted_users = {}
 
 # Функция для форматирования времени
 def format_time(seconds: int) -> str:
@@ -57,6 +59,60 @@ def format_time(seconds: int) -> str:
     else:
         return f"{seconds} секунд"
 
+# Функция для ограничения прав пользователя (запрет на отправку сообщений)
+async def restrict_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int):
+    """Ограничивает пользователя (запрещает отправку сообщений)"""
+    try:
+        # Создаем права с запретом отправки сообщений
+        permissions = ChatPermissions(
+            can_send_messages=False,
+            can_send_media_messages=False,
+            can_send_polls=False,
+            can_send_other_messages=False,
+            can_add_web_page_previews=False,
+            can_change_info=False,
+            can_invite_users=False,
+            can_pin_messages=False
+        )
+        
+        await context.bot.restrict_chat_member(
+            chat_id=chat_id,
+            user_id=user_id,
+            permissions=permissions
+        )
+        logging.info(f"🔒 Пользователь {user_id} ограничен в правах в чате {chat_id}")
+        return True
+    except Exception as e:
+        logging.error(f"❌ Ошибка при ограничении пользователя {user_id}: {e}")
+        return False
+
+# Функция для снятия ограничений с пользователя
+async def unrestrict_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int):
+    """Снимает ограничения с пользователя (разрешает отправку сообщений)"""
+    try:
+        # Создаем полные права
+        permissions = ChatPermissions(
+            can_send_messages=True,
+            can_send_media_messages=True,
+            can_send_polls=True,
+            can_send_other_messages=True,
+            can_add_web_page_previews=True,
+            can_change_info=False,
+            can_invite_users=True,
+            can_pin_messages=False
+        )
+        
+        await context.bot.restrict_chat_member(
+            chat_id=chat_id,
+            user_id=user_id,
+            permissions=permissions
+        )
+        logging.info(f"🔓 С пользователя {user_id} сняты ограничения в чате {chat_id}")
+        return True
+    except Exception as e:
+        logging.error(f"❌ Ошибка при снятии ограничений с пользователя {user_id}: {e}")
+        return False
+
 # Функция для кика пользователя
 async def kick_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, reason: str = "Нарушение правил"):
     """Универсальная функция для кика пользователя"""
@@ -74,6 +130,10 @@ async def kick_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: i
             user_id=user_id
         )
         logging.info(f"✅ Пользователь {user_id} разбанен (кик выполнен)")
+        
+        # Удаляем из списка ограниченных, если был
+        if user_id in restricted_users:
+            del restricted_users[user_id]
         
         return True
     except Exception as e:
@@ -135,6 +195,17 @@ async def new_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             'agreed': False,
             'joined_time': update.message.date.timestamp()
         }
+        
+        # Сразу ограничиваем пользователя (запрещаем писать)
+        restrict_success = await restrict_user(
+            context=context,
+            chat_id=update.effective_chat.id,
+            user_id=member.id
+        )
+        
+        if restrict_success:
+            restricted_users[member.id] = True
+            logging.info(f"🔒 Пользователь {member.id} ограничен в правах при входе")
             
         keyboard = [
             [
@@ -148,7 +219,8 @@ async def new_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         sent_message = await update.message.reply_text(
             f"👋 Добро пожаловать, {member.first_name}!\n\n{RULES_TEXT}\n\n"
             f"⏰ У вас есть 24 часа, чтобы принять правила!\n"
-            f"Если вы не примете правила в течение суток, вы будете автоматически удалены из чата.",
+            f"Если вы не примете правила в течение суток, вы будете автоматически удалены из чата.\n\n"
+            f"🔒 *Внимание!* До принятия правил вы НЕ МОЖЕТЕ писать в чат!",
             reply_markup=reply_markup,
             parse_mode='Markdown'
         )
@@ -186,6 +258,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_agreements[user_id]['agreed'] = True
         else:
             user_agreements[user_id] = {'agreed': True, 'joined_time': query.message.date.timestamp()}
+        
+        # Снимаем ограничения с пользователя (разрешаем писать)
+        unrestrict_success = await unrestrict_user(
+            context=context,
+            chat_id=chat_id,
+            user_id=user_id
+        )
+        
+        if unrestrict_success and user_id in restricted_users:
+            del restricted_users[user_id]
+            logging.info(f"🔓 С пользователя {user_id} сняты ограничения")
         
         # Отменяем задачу на кик, если она есть
         if user_id in kick_tasks:
@@ -248,6 +331,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Удаляем пользователя из словаря
             if user_id in user_agreements:
                 del user_agreements[user_id]
+            
+            if user_id in restricted_users:
+                del restricted_users[user_id]
 
 # Обработчик сообщений (проверка, принял ли пользователь правила)
 async def check_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -279,7 +365,8 @@ async def check_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 chat_id=chat_id,
                 text=f"⚠️ {update.effective_user.mention_html()}, вы не можете писать в чат, пока не примете правила!\n"
                      f"У вас есть 24 часа, чтобы нажать кнопку \"✅ Согласен\".\n"
-                     f"В противном случае вы будете автоматически удалены.",
+                     f"В противном случае вы будете автоматически удалены.\n\n"
+                     f"🔒 Ваши сообщения блокируются автоматически!",
                 parse_mode='HTML'
             )
             
@@ -291,6 +378,16 @@ async def check_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             'agreed': False,
             'joined_time': update.message.date.timestamp()
         }
+        
+        # Сразу ограничиваем пользователя
+        restrict_success = await restrict_user(
+            context=context,
+            chat_id=chat_id,
+            user_id=user_id
+        )
+        
+        if restrict_success:
+            restricted_users[user_id] = True
         
         # Удаляем сообщение
         try:
@@ -311,7 +408,8 @@ async def check_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             chat_id=chat_id,
             text=f"👋 {update.effective_user.mention_html()}, вы не приняли правила чата!\n\n{RULES_TEXT}\n\n"
                  f"⏰ У вас есть 24 часа, чтобы принять правила!\n"
-                 f"Если вы не примете правила в течение суток, вы будете автоматически удалены из чата.",
+                 f"Если вы не примете правила в течение суток, вы будете автоматически удалены из чата.\n\n"
+                 f"🔒 *Внимание!* До принятия правил вы НЕ МОЖЕТЕ писать в чат!",
             reply_markup=reply_markup,
             parse_mode='Markdown'
         )
@@ -345,13 +443,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Запрашиваю согласие с правилами\n"
         "• ⏰ Кикаю через 24 часа, если не принял правила\n"
         "• 🔨 Удаляю тех, кто отказался\n"
-        "• 🛡️ Блокирую сообщения от тех, кто не принял правила\n\n"
+        "• 🛡️ Блокирую сообщения от тех, кто не принял правила\n"
+        "• 🔒 Автоматически ограничиваю права новых пользователей\n\n"
         "🔧 *Как использовать:*\n"
         "1. Добавьте меня в группу\n"
         "2. Сделайте меня администратором с правами:\n"
         "   ✅ Отправка сообщений\n"
         "   ✅ Удаление сообщений\n"
         "   ✅ Блокировка пользователей\n"
+        "   ✅ Ограничение пользователей (важно для запрета сообщений!)\n"
         "3. Готово! Я буду автоматически работать\n\n"
         "👑 *Команды для админов:*\n"
         "/rules - показать правила\n"
@@ -387,8 +487,9 @@ async def check_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             user = await context.bot.get_chat(uid)
             name = user.full_name or user.username or str(uid)
-            status = "✅ Согласился" if data.get('agreed', False) else "❌ Не согласился (будет кикнут через 24 часа)"
-            text += f"• {name} — {status}\n"
+            status = "✅ Согласился" if data.get('agreed', False) else "❌ Не согласился (заблокирован)"
+            is_restricted = "🔒 Ограничен" if uid in restricted_users else "🔓 Не ограничен"
+            text += f"• {name} — {status} ({is_restricted})\n"
         except:
             text += f"• ID {uid} — {data.get('agreed', False)}\n"
     
@@ -434,6 +535,8 @@ async def kick_waiting_users(update: Update, context: ContextTypes.DEFAULT_TYPE)
             if uid in kick_tasks:
                 kick_tasks[uid].cancel()
                 del kick_tasks[uid]
+            if uid in restricted_users:
+                del restricted_users[uid]
     
     await update.message.reply_text(
         f"✅ Кикнуто {kicked} из {len(waiting_users)} пользователей, не принявших правила."
@@ -492,7 +595,8 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 *Статистика принятия правил*\n\n"
         f"👥 Всего участников на рассмотрении: {total}\n"
         f"✅ Согласились: {agreed}\n"
-        f"❌ Не согласились (будут кикнуты через 24 часа): {declined}\n\n"
+        f"❌ Не согласились (заблокированы): {declined}\n"
+        f"🔒 Ограниченных пользователей: {len(restricted_users)}\n\n"
         f"⏰ Время на принятие правил: 24 часа"
     )
     
@@ -520,8 +624,10 @@ def main():
     print("  3. Включить права на:")
     print("     ✅ Отправка сообщений")
     print("     ✅ Удаление сообщений")
-    print("     ✅ Блокировка пользователей (ЭТО ВАЖНО ДЛЯ КИКА!)")
-    print("\n⏰ Бот будет кикать через 24 часа, если пользователь не принял правила!")
+    print("     ✅ Блокировка пользователей")
+    print("     ✅ Ограничение пользователей (ВАЖНО для запрета сообщений!)")
+    print("\n🔒 НОВОЕ: Пользователи автоматически ограничиваются в правах до принятия правил!")
+    print("⏰ Бот будет кикать через 24 часа, если пользователь не принял правила!")
     print("👑 Команды админа:")
     print("  /check - проверить статус пользователей")
     print("  /kick_waiting - кикнуть всех, кто не принял правила")
